@@ -25,6 +25,13 @@ except ImportError:
 
 import config as cfg
 from candle_detector import analyze_candle
+from order_executor import (
+    execute_signal,
+    cancel_all_pending,
+    get_open_positions,
+    get_pending_orders,
+    get_account_info,
+)
 
 # =============================================================================
 # SETUP LOGGING
@@ -166,171 +173,10 @@ def get_candles(symbol: str, timeframe_str: str, count: int) -> pd.DataFrame | N
 
 
 # =============================================================================
-# BAGIAN 3: MEMASANG DAN MENGELOLA LIMIT ORDER
+# BAGIAN 3: MANAJEMEN ORDER — didelegasikan ke order_executor.py
 # =============================================================================
-
-def count_open_positions(symbol: str) -> int:
-    """Menghitung jumlah posisi yang sedang terbuka untuk simbol tertentu."""
-    if mt5 is None:
-        return 0
-    positions = mt5.positions_get(symbol=symbol)
-    return len(positions) if positions else 0
-
-
-def count_pending_orders(symbol: str) -> int:
-    """Menghitung jumlah pending order yang belum terisi untuk simbol tertentu."""
-    if mt5 is None:
-        return 0
-    orders = mt5.orders_get(symbol=symbol)
-    return len(orders) if orders else 0
-
-
-def get_symbol_info(symbol: str) -> dict | None:
-    """Mengambil informasi symbol: lot min, pip size, dll."""
-    if mt5 is None:
-        return None
-    info = mt5.symbol_info(symbol)
-    if info is None:
-        logger.error(f"Symbol info tidak ditemukan: {symbol}")
-        return None
-    return info
-
-
-def calculate_lot_size(symbol: str, sl_distance: float) -> float:
-    """
-    Menghitung ukuran lot berdasarkan risiko.
-    Jika USE_FIXED_LOT=True → gunakan FIXED_LOT dari config.
-    Jika USE_FIXED_LOT=False → hitung lot berdasarkan RISK_PERCENT dari balance.
-    """
-    if cfg.USE_FIXED_LOT:
-        return cfg.FIXED_LOT
-
-    # Kalkulasi lot otomatis berdasarkan risiko
-    if mt5 is None or sl_distance == 0:
-        return cfg.FIXED_LOT
-
-    account    = mt5.account_info()
-    balance    = account.balance
-    risk_money = balance * cfg.RISK_PERCENT  # uang yang dirisikkan per trade
-
-    sym_info   = get_symbol_info(symbol)
-    if sym_info is None:
-        return cfg.FIXED_LOT
-
-    # Nilai per pip per lot (untuk XAUUSD biasanya $1 per pip per 0.01 lot)
-    tick_value = sym_info.trade_tick_value
-    tick_size  = sym_info.trade_tick_size
-
-    if tick_size == 0:
-        return cfg.FIXED_LOT
-
-    pips_at_risk = sl_distance / tick_size
-    lot = risk_money / (pips_at_risk * tick_value)
-    lot = max(sym_info.volume_min, round(lot, 2))
-    lot = min(sym_info.volume_max, lot)
-
-    return lot
-
-
-def place_limit_order(symbol: str, signal_data: dict) -> bool:
-    """
-    Memasang Limit Order (Pending Order) berdasarkan data sinyal.
-
-    Order type:
-      - Sinyal BUY  → ORDER_TYPE_BUY_LIMIT  (entry di bawah harga market)
-      - Sinyal SELL → ORDER_TYPE_SELL_LIMIT (entry di atas harga market)
-
-    Expiry: ORDER_EXPIRY_SEC detik dari sekarang (default 60 detik = 1 candle M1)
-    """
-    if mt5 is None:
-        logger.error("MT5 tidak tersedia, tidak bisa pasang order.")
-        return False
-
-    signal      = signal_data['signal']
-    entry_price = signal_data['entry']
-    sl_price    = signal_data['sl']
-    tp_price    = signal_data['tp']
-    sl_distance = signal_data['sl_distance']
-    candle_type = signal_data['candle_type']
-
-    lot = calculate_lot_size(symbol, sl_distance)
-
-    # Tentukan tipe order
-    if signal == "BUY":
-        order_type = mt5.ORDER_TYPE_BUY_LIMIT
-        type_str   = "BUY LIMIT"
-    elif signal == "SELL":
-        order_type = mt5.ORDER_TYPE_SELL_LIMIT
-        type_str   = "SELL LIMIT"
-    else:
-        return False
-
-    # Waktu kadaluarsa order (expiry)
-    expiry_time = int(time.time()) + cfg.ORDER_EXPIRY_SEC
-
-    request = {
-        "action"      : mt5.TRADE_ACTION_PENDING,
-        "symbol"      : symbol,
-        "volume"      : lot,
-        "type"        : order_type,
-        "price"       : entry_price,
-        "sl"          : sl_price,
-        "tp"          : tp_price,
-        "type_time"   : mt5.ORDER_TIME_SPECIFIED,  # order punya waktu kadaluarsa
-        "expiration"  : expiry_time,
-        "comment"     : f"MomBot|{candle_type[:8]}|{signal}",
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-
-    result = mt5.order_send(request)
-
-    if result.retcode == mt5.TRADE_RETCODE_DONE:
-        msg = (
-            f"📋 *{type_str} TERPASANG*\n"
-            f"Symbol : {symbol}\n"
-            f"Candle : {candle_type}\n"
-            f"Entry  : {entry_price}\n"
-            f"SL     : {sl_price}\n"
-            f"TP     : {tp_price}\n"
-            f"Lot    : {lot}\n"
-            f"Expiry : 60 detik"
-        )
-        logger.info(f"[OK] {type_str} berhasil dipasang | Ticket: {result.order}")
-        send_telegram(msg)
-        return True
-    else:
-        logger.error(
-            f"[FAIL] Gagal pasang {type_str} | Retcode: {result.retcode} | "
-            f"Comment: {result.comment}"
-        )
-        return False
-
-
-def cancel_expired_orders(symbol: str):
-    """
-    Membatalkan semua pending order yang sudah melewati waktu expiry.
-    MT5 biasanya membatalkan otomatis jika type_time=ORDER_TIME_SPECIFIED,
-    fungsi ini sebagai fallback safety.
-    """
-    if mt5 is None:
-        return
-
-    orders = mt5.orders_get(symbol=symbol)
-    if not orders:
-        return
-
-    now = int(time.time())
-    for order in orders:
-        if order.time_expiration > 0 and now > order.time_expiration:
-            request = {
-                "action": mt5.TRADE_ACTION_REMOVE,
-                "order" : order.ticket,
-            }
-            result = mt5.order_send(request)
-            if result.retcode == mt5.TRADE_RETCODE_DONE:
-                logger.info(f"[CANCEL] Pending order #{order.ticket} dibatalkan (expired).")
-            else:
-                logger.warning(f"[WARN] Gagal cancel order #{order.ticket}: {result.comment}")
+# Semua logika eksekusi order (BUY/SELL limit & market, cancel, close)
+# ada di order_executor.py agar kode lebih terstruktur dan mudah di-maintain.
 
 
 # =============================================================================
@@ -410,7 +256,7 @@ def run():
         while True:
             # ── Tunggu candle berikutnya close ───────────────────────────────
             candle_close_time = wait_for_candle_close()
-            logger.info(f"─── Candle close: {candle_close_time.strftime('%Y-%m-%d %H:%M:%S')} UTC ───")
+            logger.info(f"--- Candle close: {candle_close_time.strftime('%Y-%m-%d %H:%M:%S')} UTC ---")
 
             # ── Ambil data candle terbaru ─────────────────────────────────────
             df = get_candles(symbol, cfg.TIMEFRAME, cfg.CANDLES_NEEDED + 2)
@@ -418,19 +264,19 @@ def run():
                 logger.warning("Data candle tidak tersedia. Skip siklus ini.")
                 continue
 
-            # ── Bersihkan order yang sudah kadaluarsa ─────────────────────────
-            cancel_expired_orders(symbol)
+            # ── Bersihkan pending order kadaluarsa (fallback safety) ──────────
+            cancel_all_pending(symbol)
 
-            # ── Cek apakah masih ada posisi/order terbuka ────────────────────
-            open_pos = count_open_positions(symbol)
-            pending  = count_pending_orders(symbol)
+            # ── Cek posisi & pending order ────────────────────────────────────
+            open_pos = get_open_positions(symbol)
+            pending  = get_pending_orders(symbol)
 
-            if open_pos >= cfg.MAX_OPEN_POSITIONS:
-                logger.info(f"[WAIT] Posisi terbuka: {open_pos}. Menunggu posisi selesai.")
+            if len(open_pos) >= cfg.MAX_OPEN_POSITIONS:
+                logger.info(f"[WAIT] Posisi terbuka: {len(open_pos)}. Menunggu posisi selesai.")
                 continue
 
-            if pending > 0:
-                logger.info(f"[WAIT] Masih ada {pending} pending order. Skip analisa.")
+            if len(pending) > 0:
+                logger.info(f"[WAIT] Masih ada {len(pending)} pending order. Skip analisa.")
                 continue
 
             # ── Analisa candle ────────────────────────────────────────────────
@@ -440,7 +286,7 @@ def run():
                 logger.info("[--] Tidak ada momentum candle terdeteksi. Standby...")
                 continue
 
-            # ── Ada sinyal → pasang Limit Order ──────────────────────────────
+            # ── Ada sinyal → eksekusi via order_executor ─────────────────────
             logger.info(
                 f"[SIGNAL] {signal_data['signal']} | "
                 f"Tipe: {signal_data['candle_type']} | "
@@ -448,7 +294,11 @@ def run():
                 f"SL: {signal_data['sl']} | TP: {signal_data['tp']}"
             )
 
-            place_limit_order(symbol, signal_data)
+            result = execute_signal(signal_data, symbol)
+            if result['success']:
+                logger.info(f"[OK] Order berhasil | Ticket: {result['ticket']} | Tipe: {result['order_type']}")
+            else:
+                logger.error(f"[FAIL] Order gagal | {result['error']}")
 
     except KeyboardInterrupt:
         logger.info("[STOP] Robot dihentikan oleh user (Ctrl+C).")

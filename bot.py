@@ -10,6 +10,8 @@
 #   6. Kirim notifikasi Telegram untuk setiap event penting
 # =============================================================================
 
+import sys
+import io
 import time
 import logging
 import requests
@@ -26,15 +28,37 @@ from candle_detector import analyze_candle
 
 # =============================================================================
 # SETUP LOGGING
+# Fix: Windows cmd menggunakan CP1252 yang tidak bisa encode emoji.
+# Solusi: paksa StreamHandler menggunakan UTF-8 secara eksplisit.
 # =============================================================================
-logging.basicConfig(
-    level   = getattr(logging, cfg.LOG_LEVEL, logging.INFO),
-    format  = "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),                      # tampil di terminal
-        logging.FileHandler(cfg.LOG_FILE, mode='a'),  # simpan ke file log
-    ]
-)
+def _make_stream_handler() -> logging.StreamHandler:
+    """Membuat StreamHandler dengan encoding UTF-8 agar aman di Windows."""
+    try:
+        # Python 3.9+: buka stdout buffer dengan encoding UTF-8
+        utf8_stream = io.TextIOWrapper(
+            sys.stdout.buffer,
+            encoding='utf-8',
+            errors='replace',  # karakter yang tidak bisa di-encode → diganti '?'
+            line_buffering=True,
+        )
+        handler = logging.StreamHandler(utf8_stream)
+    except AttributeError:
+        # Fallback: sys.stdout tidak punya .buffer (misal saat di-redirect)
+        handler = logging.StreamHandler(sys.stdout)
+    return handler
+
+log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+log_level     = getattr(logging, cfg.LOG_LEVEL, logging.INFO)
+
+_stream_handler = _make_stream_handler()
+_stream_handler.setFormatter(log_formatter)
+_stream_handler.setLevel(log_level)
+
+_file_handler = logging.FileHandler(cfg.LOG_FILE, mode='a', encoding='utf-8')
+_file_handler.setFormatter(log_formatter)
+_file_handler.setLevel(log_level)
+
+logging.basicConfig(level=log_level, handlers=[_stream_handler, _file_handler])
 logger = logging.getLogger("MomentumBot")
 
 
@@ -70,11 +94,11 @@ def connect_mt5() -> bool:
 
     account_info = mt5.account_info()
     logger.info(
-        f"✅ Terkoneksi ke MT5 | Akun: {account_info.login} | "
+        f"[OK] Terkoneksi ke MT5 | Akun: {account_info.login} | "
         f"Balance: {account_info.balance:.2f} {account_info.currency} | "
         f"Server: {account_info.server}"
     )
-    send_telegram(f"🤖 Robot Momentum M1 aktif\nAkun: {account_info.login}\nBalance: {account_info.balance:.2f} {account_info.currency}")
+    send_telegram(f"Robot Momentum M1 aktif\nAkun: {account_info.login}\nBalance: {account_info.balance:.2f} {account_info.currency}")
     return True
 
 
@@ -271,12 +295,12 @@ def place_limit_order(symbol: str, signal_data: dict) -> bool:
             f"Lot    : {lot}\n"
             f"Expiry : 60 detik"
         )
-        logger.info(f"✅ {type_str} berhasil dipasang | Ticket: {result.order}")
+        logger.info(f"[OK] {type_str} berhasil dipasang | Ticket: {result.order}")
         send_telegram(msg)
         return True
     else:
         logger.error(
-            f"❌ Gagal pasang {type_str} | Retcode: {result.retcode} | "
+            f"[FAIL] Gagal pasang {type_str} | Retcode: {result.retcode} | "
             f"Comment: {result.comment}"
         )
         return False
@@ -304,9 +328,9 @@ def cancel_expired_orders(symbol: str):
             }
             result = mt5.order_send(request)
             if result.retcode == mt5.TRADE_RETCODE_DONE:
-                logger.info(f"🗑️  Pending order #{order.ticket} dibatalkan (expired).")
+                logger.info(f"[CANCEL] Pending order #{order.ticket} dibatalkan (expired).")
             else:
-                logger.warning(f"Gagal cancel order #{order.ticket}: {result.comment}")
+                logger.warning(f"[WARN] Gagal cancel order #{order.ticket}: {result.comment}")
 
 
 # =============================================================================
@@ -373,7 +397,7 @@ def run():
     └──────────────────────────────────────────────────────────┘
     """
     logger.info("=" * 60)
-    logger.info("  🚀 Robot Scalping Momentum M1 — XAUUSD  ")
+    logger.info("  [START] Robot Scalping Momentum M1 -- XAUUSD  ")
     logger.info("=" * 60)
 
     if not connect_mt5():
@@ -402,23 +426,23 @@ def run():
             pending  = count_pending_orders(symbol)
 
             if open_pos >= cfg.MAX_OPEN_POSITIONS:
-                logger.info(f"⏸️  Posisi terbuka: {open_pos}. Menunggu posisi selesai.")
+                logger.info(f"[WAIT] Posisi terbuka: {open_pos}. Menunggu posisi selesai.")
                 continue
 
             if pending > 0:
-                logger.info(f"⏸️  Masih ada {pending} pending order. Skip analisa.")
+                logger.info(f"[WAIT] Masih ada {pending} pending order. Skip analisa.")
                 continue
 
             # ── Analisa candle ────────────────────────────────────────────────
             signal_data = analyze_candle(df, cfg)
 
             if signal_data is None:
-                logger.info("🔍 Tidak ada momentum candle terdeteksi. Standby...")
+                logger.info("[--] Tidak ada momentum candle terdeteksi. Standby...")
                 continue
 
             # ── Ada sinyal → pasang Limit Order ──────────────────────────────
             logger.info(
-                f"🎯 Sinyal: {signal_data['signal']} | "
+                f"[SIGNAL] {signal_data['signal']} | "
                 f"Tipe: {signal_data['candle_type']} | "
                 f"Entry: {signal_data['entry']} | "
                 f"SL: {signal_data['sl']} | TP: {signal_data['tp']}"
@@ -427,12 +451,12 @@ def run():
             place_limit_order(symbol, signal_data)
 
     except KeyboardInterrupt:
-        logger.info("\n⏹️  Robot dihentikan oleh user (Ctrl+C).")
-        send_telegram("⛔ Robot Momentum M1 dihentikan secara manual.")
+        logger.info("[STOP] Robot dihentikan oleh user (Ctrl+C).")
+        send_telegram("[STOP] Robot Momentum M1 dihentikan secara manual.")
 
     except Exception as e:
-        logger.exception(f"❌ Error tidak terduga: {e}")
-        send_telegram(f"❌ Robot ERROR: {e}")
+        logger.exception(f"[ERROR] Error tidak terduga: {e}")
+        send_telegram(f"[ERROR] Robot ERROR: {e}")
 
     finally:
         disconnect_mt5()

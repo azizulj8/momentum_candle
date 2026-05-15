@@ -416,17 +416,40 @@ def analyze_candle(df: pd.DataFrame, cfg) -> dict | None:
     pip_size    = 0.10
     candle_type = None
     signal      = None
+    use_market  = False  # False = Limit Order, True = Market Order langsung
 
-    # ── Filter 3: Deteksi candle — HANYA Impulse ──────────────────────────────
+    # ── Filter 3: Deteksi candle ──────────────────────────────────────────────
+    #
+    # MARUBOZU  → momentum PENUH, tidak ada wick sama sekali
+    #             Strategi: MARKET ORDER langsung (jangan tunggu pullback!)
+    #             Alasan: Setelah Marubozu, pullback sering sangat dalam
+    #             sehingga Limit Order sering kena SL sebelum lanjut.
+    #             Masuk langsung di market lebih aman untuk pola ini.
+    #
+    # IMPULSE   → momentum kuat, ada sedikit wick
+    #             Strategi: LIMIT ORDER (tunggu pullback 38%)
+    #             Alasan: Setelah Impulse, harga sering pullback wajar
+    #             sebelum lanjut searah sinyal.
+    #
     if trend_up:
-        if detect_bullish_impulse(candle, atr, cfg):
+        if detect_marubozu_bullish(candle, atr, cfg):
+            candle_type = "Marubozu Bullish"
+            signal      = "BUY"
+            use_market  = True   # Marubozu: langsung market order
+        elif detect_bullish_impulse(candle, atr, cfg):
             candle_type = "Bullish Impulse"
             signal      = "BUY"
+            use_market  = False  # Impulse: tunggu pullback via limit order
 
     if trend_down and signal is None:
-        if detect_bearish_impulse(candle, atr, cfg):
+        if detect_marubozu_bearish(candle, atr, cfg):
+            candle_type = "Marubozu Bearish"
+            signal      = "SELL"
+            use_market  = True   # Marubozu: langsung market order
+        elif detect_bearish_impulse(candle, atr, cfg):
             candle_type = "Bearish Impulse"
             signal      = "SELL"
+            use_market  = False  # Impulse: tunggu pullback via limit order
 
     if signal is None:
         return None
@@ -451,24 +474,26 @@ def analyze_candle(df: pd.DataFrame, cfg) -> dict | None:
         logger.debug(f"[SKIP] Struktur harga tidak bersih pada {ts}")
         return None
 
-    # ── Hitung harga Limit Order ──────────────────────────────────────────────
+    # ── Hitung harga order ────────────────────────────────────────────────────
     order_prices = calculate_limit_order_prices(candle, signal, cfg, pip_size)
 
     result = {
-        "candle_type" : candle_type,
-        "signal"      : signal,
-        "candle_open" : candle['open'],
-        "candle_high" : candle['high'],
-        "candle_low"  : candle['low'],
-        "candle_close": candle['close'],
-        "body_size"   : round(candle['body'], 4),
-        "atr"         : round(atr, 4),
-        "ema"         : round(ema, 2),
+        "candle_type"    : candle_type,
+        "signal"         : signal,
+        "use_market_order": use_market,   # True=market order, False=limit order
+        "candle_open"    : candle['open'],
+        "candle_high"    : candle['high'],
+        "candle_low"     : candle['low'],
+        "candle_close"   : candle['close'],
+        "body_size"      : round(candle['body'], 4),
+        "atr"            : round(atr, 4),
+        "ema"            : round(ema, 2),
         **order_prices,
     }
 
+    order_mode = "MARKET" if use_market else "LIMIT"
     logger.info(
-        f"[SIGNAL] {candle_type} | {signal} | "
+        f"[SIGNAL] {candle_type} | {signal} | Mode: {order_mode} | "
         f"Entry: {order_prices['entry']} | SL: {order_prices['sl']} | "
         f"TP: {order_prices['tp']}"
     )

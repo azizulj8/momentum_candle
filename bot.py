@@ -294,9 +294,12 @@ def run():
                 f"SL: {signal_data['sl']} | TP: {signal_data['tp']}"
             )
 
-            result = execute_signal(signal_data, symbol)
+            # Marubozu → Market Order langsung | Impulse → Limit Order (tunggu pullback)
+            use_market = signal_data.get('use_market_order', False)
+            result = execute_signal(signal_data, symbol, use_market_order=use_market)
             if result['success']:
-                logger.info(f"[OK] Order berhasil | Ticket: {result['ticket']} | Tipe: {result['order_type']}")
+                mode = "MARKET" if use_market else "LIMIT"
+                logger.info(f"[OK] {mode} order berhasil | Ticket: {result['ticket']} | Tipe: {result['order_type']}")
             else:
                 logger.error(f"[FAIL] Order gagal | {result['error']}")
 

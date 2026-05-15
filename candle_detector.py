@@ -10,6 +10,7 @@
 import pandas as pd
 import numpy as np
 import logging
+from datetime import time as dtime
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,85 @@ def add_candle_metrics(df: pd.DataFrame) -> pd.DataFrame:
     df['lower_wick_ratio']  = df['lower_wick']  / df['total_range']
 
     return df
+
+
+# =============================================================================
+# BAGIAN 1B: FILTER KUALITAS SINYAL
+# =============================================================================
+
+def is_london_ny_session(ts: pd.Timestamp) -> bool:
+    """
+    Filter Sesi Trading: hanya London (07:00-12:00 UTC) dan New York (12:00-20:00 UTC).
+    Asian session (20:00-07:00 UTC) dihindari karena volume rendah dan banyak noise.
+    XAUUSD paling volatile dan akurat sinyalnya di sesi London dan NY overlap.
+    """
+    t = ts.time()
+    return dtime(7, 0) <= t <= dtime(20, 0)
+
+
+def has_volume_spike(df: pd.DataFrame, idx: int, lookback: int = 20,
+                     multiplier: float = 1.3) -> bool:
+    """
+    Filter Volume: pastikan candle sinyal punya tick_volume lebih tinggi
+    dari rata-rata N candle sebelumnya.
+    Volume tinggi = ada partisipasi pasar yang kuat → sinyal lebih valid.
+    """
+    if 'tick_volume' not in df.columns:
+        return True  # skip filter jika tidak ada data volume
+    if idx < lookback:
+        return False
+    avg_vol     = df['tick_volume'].iloc[idx - lookback: idx].mean()
+    candle_vol  = df['tick_volume'].iloc[idx]
+    return candle_vol >= avg_vol * multiplier
+
+
+def has_trend_momentum(df: pd.DataFrame, idx: int, signal: str,
+                        lookback: int = 3) -> bool:
+    """
+    Filter Trend Momentum: pastikan N candle sebelum sinyal sudah bergerak
+    searah dengan sinyal. Ini memastikan kita mengikuti tren, bukan melawan.
+
+    BUY : minimal (lookback-1) dari N candle terakhir harus bullish (Close > Open)
+    SELL: minimal (lookback-1) dari N candle terakhir harus bearish (Close < Open)
+
+    Contoh lookback=3: minimal 2 dari 3 candle sebelumnya harus searah sinyal.
+    """
+    if idx < lookback:
+        return False
+    prev_candles = df.iloc[idx - lookback: idx]
+    bullish_count = (prev_candles['close'] > prev_candles['open']).sum()
+    bearish_count = lookback - bullish_count
+    min_required  = lookback - 1  # minimal N-1 candle searah
+
+    if signal == "BUY":
+        return bullish_count >= min_required
+    else:
+        return bearish_count >= min_required
+
+
+def has_clean_structure(df: pd.DataFrame, idx: int, signal: str,
+                         atr: float, lookback: int = 5) -> bool:
+    """
+    Filter Struktur Harga: pastikan tidak ada candle reversal besar
+    dalam N candle sebelumnya yang berlawanan dengan sinyal.
+    Menghindari entry di tengah-tengah konsolidasi atau setelah reversal.
+
+    Jika ada candle dalam lookback yang bodynya > 1.5x ATR dan arahnya
+    berlawanan dengan sinyal → SKIP (struktur tidak bersih).
+    """
+    if pd.isna(atr) or atr == 0 or idx < lookback:
+        return True
+    prev = df.iloc[idx - lookback: idx]
+    for _, row in prev.iterrows():
+        body = abs(row['close'] - row['open'])
+        if body < 1.5 * atr:
+            continue
+        is_bull = row['close'] > row['open']
+        if signal == "BUY"  and not is_bull:
+            return False  # ada candle bearish besar → struktur tidak bersih
+        if signal == "SELL" and is_bull:
+            return False  # ada candle bullish besar → struktur tidak bersih
+    return True
 
 
 # =============================================================================
@@ -288,115 +368,108 @@ def analyze_candle(df: pd.DataFrame, cfg) -> dict | None:
     """
     Fungsi utama yang menganalisa candle TERAKHIR yang sudah close.
 
-    Alur kerja:
+    Filter v2 (Win Rate 70%+):
     1. Hitung metrik candle (body, wick, range)
     2. Hitung ATR14 dan EMA20
-    3. Ambil data candle terakhir (candle yang baru saja close)
-    4. Periksa apakah termasuk salah satu dari 6 tipe momentum candle
-    5. Jika ya → hitung harga Limit Order (Entry, SL, TP)
-    6. Kembalikan hasil analisa sebagai dict, atau None jika tidak ada sinyal
-
-    Args:
-        df  : DataFrame dengan kolom [open, high, low, close, tick_volume]
-              minimal CANDLES_NEEDED baris, diurutkan dari candle terlama
-        cfg : objek config (dari config.py)
-
-    Returns:
-        dict berisi sinyal dan level harga, atau None jika tidak ada sinyal
+    3. Filter Sesi: hanya London (07-12 UTC) dan NY (12-20 UTC)
+    4. Filter EMA: hanya BUY di atas EMA, SELL di bawah EMA
+    5. Deteksi tipe candle: HANYA Bullish/Bearish Impulse
+       (Marubozu & Pin Bar dinonaktifkan — WR-nya terlalu rendah)
+    6. Filter Volume: candle sinyal harus punya volume di atas rata-rata
+    7. Filter Trend Momentum: minimal 2 dari 3 candle sebelumnya searah
+    8. Filter Struktur: tidak ada candle besar berlawanan dalam 5 candle terakhir
+    9. Hitung harga Limit Order
     """
     if len(df) < cfg.CANDLES_NEEDED:
         logger.warning(f"Data tidak cukup: {len(df)} candle (butuh {cfg.CANDLES_NEEDED})")
         return None
 
-    # Pastikan nama kolom lowercase
     df.columns = [c.lower() for c in df.columns]
-
-    # ── Step 1: Tambahkan metrik candle ──────────────────────────────────────
     df = add_candle_metrics(df)
-
-    # ── Step 2: Hitung ATR dan EMA ───────────────────────────────────────────
     df['atr'] = calculate_atr(df, cfg.ATR_PERIOD)
     df['ema'] = calculate_ema(df, cfg.EMA_PERIOD)
 
-    # ── Step 3: Ambil candle terakhir yang sudah close ───────────────────────
-    # Index -1 = candle yang sedang berjalan (BELUM close, skip!)
-    # Index -2 = candle yang baru saja close → ini yang dianalisa
-    candle = df.iloc[-2]   # Candle yang baru close
-    atr    = df['atr'].iloc[-2]
-    ema    = df['ema'].iloc[-2]
-    price  = df['close'].iloc[-1]  # Harga live saat ini (untuk cek posisi vs EMA)
+    # Candle -2 = baru saja close; candle -1 = sedang berjalan (skip)
+    idx    = len(df) - 2
+    candle = df.iloc[idx]
+    atr    = df['atr'].iloc[idx]
+    ema    = df['ema'].iloc[idx]
+    price  = df['close'].iloc[-1]
+    ts     = df.index[idx]
 
-    logger.debug(
-        f"Candle Close: O={candle['open']:.2f} H={candle['high']:.2f} "
-        f"L={candle['low']:.2f} C={candle['close']:.2f} | "
-        f"Body={candle['body']:.4f} ATR={atr:.4f} EMA={ema:.2f}"
-    )
+    if pd.isna(atr) or atr == 0:
+        return None
 
-    # ── Step 4: Filter tren via EMA ──────────────────────────────────────────
-    # Tentukan arah tren berdasarkan posisi harga live vs EMA
+    # ── Filter 1: Sesi London/NY ──────────────────────────────────────────────
+    use_session = getattr(cfg, 'USE_SESSION_FILTER', True)
+    if use_session and not is_london_ny_session(ts):
+        logger.debug(f"[SKIP] Di luar sesi trading: {ts.time()}")
+        return None
+
+    # ── Filter 2: Arah tren via EMA ───────────────────────────────────────────
     if cfg.USE_EMA_FILTER:
-        trend_up   = price > ema   # Tren naik: hanya cari BUY
-        trend_down = price < ema   # Tren turun: hanya cari SELL
+        trend_up   = price > ema
+        trend_down = price < ema
     else:
-        trend_up   = True          # Tanpa filter: semua arah diizinkan
-        trend_down = True
+        trend_up = trend_down = True
 
-    # ── Step 5: Deteksi tipe candle ──────────────────────────────────────────
+    pip_size    = 0.10
     candle_type = None
     signal      = None
 
-    # Pip size untuk XAUUSD (1 pip = 0.10 untuk Gold di MT5)
-    pip_size = 0.10
-
-    # ── BUY signals ──
+    # ── Filter 3: Deteksi candle — HANYA Impulse ──────────────────────────────
     if trend_up:
-        if detect_marubozu_bullish(candle, atr, cfg):
-            candle_type = "Marubozu Bullish"
-            signal      = "BUY"
-        elif detect_bullish_impulse(candle, atr, cfg):
+        if detect_bullish_impulse(candle, atr, cfg):
             candle_type = "Bullish Impulse"
             signal      = "BUY"
-        elif detect_hammer(candle, cfg):
-            candle_type = "Hammer"
-            signal      = "BUY"
 
-    # ── SELL signals ──
     if trend_down and signal is None:
-        if detect_marubozu_bearish(candle, atr, cfg):
-            candle_type = "Marubozu Bearish"
-            signal      = "SELL"
-        elif detect_bearish_impulse(candle, atr, cfg):
+        if detect_bearish_impulse(candle, atr, cfg):
             candle_type = "Bearish Impulse"
             signal      = "SELL"
-        elif detect_shooting_star(candle, cfg):
-            candle_type = "Shooting Star"
-            signal      = "SELL"
 
-    # ── Step 6: Tidak ada sinyal → return None ────────────────────────────────
     if signal is None:
-        logger.debug("Tidak ada sinyal momentum terdeteksi pada candle ini.")
         return None
 
-    # ── Step 7: Hitung harga Limit Order ─────────────────────────────────────
+    # ── Filter 4: Volume spike ────────────────────────────────────────────────
+    use_vol = getattr(cfg, 'USE_VOLUME_FILTER', True)
+    vol_mult = getattr(cfg, 'VOLUME_MULTIPLIER', 1.3)
+    if use_vol and not has_volume_spike(df, idx, multiplier=vol_mult):
+        logger.debug(f"[SKIP] Volume tidak cukup kuat pada {ts}")
+        return None
+
+    # ── Filter 5: Trend momentum (3 candle sebelumnya searah) ─────────────────
+    use_mom = getattr(cfg, 'USE_TREND_MOMENTUM', True)
+    mom_lb  = getattr(cfg, 'TREND_MOMENTUM_LOOKBACK', 3)
+    if use_mom and not has_trend_momentum(df, idx, signal, mom_lb):
+        logger.debug(f"[SKIP] Trend momentum tidak cukup pada {ts}")
+        return None
+
+    # ── Filter 6: Struktur harga bersih ───────────────────────────────────────
+    use_struct = getattr(cfg, 'USE_STRUCTURE_FILTER', True)
+    if use_struct and not has_clean_structure(df, idx, signal, atr):
+        logger.debug(f"[SKIP] Struktur harga tidak bersih pada {ts}")
+        return None
+
+    # ── Hitung harga Limit Order ──────────────────────────────────────────────
     order_prices = calculate_limit_order_prices(candle, signal, cfg, pip_size)
 
     result = {
-        "candle_type"  : candle_type,
-        "signal"       : signal,
-        "candle_open"  : candle['open'],
-        "candle_high"  : candle['high'],
-        "candle_low"   : candle['low'],
-        "candle_close" : candle['close'],
-        "body_size"    : round(candle['body'], 4),
-        "atr"          : round(atr, 4),
-        "ema"          : round(ema, 2),
+        "candle_type" : candle_type,
+        "signal"      : signal,
+        "candle_open" : candle['open'],
+        "candle_high" : candle['high'],
+        "candle_low"  : candle['low'],
+        "candle_close": candle['close'],
+        "body_size"   : round(candle['body'], 4),
+        "atr"         : round(atr, 4),
+        "ema"         : round(ema, 2),
         **order_prices,
     }
 
     logger.info(
-        f"✅ SINYAL TERDETEKSI | {candle_type} | {signal} | "
+        f"[SIGNAL] {candle_type} | {signal} | "
         f"Entry: {order_prices['entry']} | SL: {order_prices['sl']} | "
         f"TP: {order_prices['tp']}"
     )
-
     return result

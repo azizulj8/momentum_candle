@@ -25,16 +25,33 @@ EMA_PERIOD          = 20    # Filter tren: hanya BUY di atas EMA, SELL di bawah 
 USE_EMA_FILTER      = True  # True = aktifkan filter tren EMA
 
 # Multiplier body terhadap ATR
-MARUBOZU_BODY_MULT  = 1.5   # Body >= 1.5x ATR → Marubozu (sinyal terkuat)
-IMPULSE_BODY_MULT   = 1.2   # Body >= 1.2x ATR → Impulse (sinyal kuat)
+MARUBOZU_BODY_MULT  = 1.5   # Body >= 1.5x ATR → Marubozu (dipakai backtest lama, bukan live)
+IMPULSE_BODY_MULT   = 1.5   # NAIK dari 1.2 ke 1.5 → body harus lebih besar (lebih selektif)
 
 # Batas maksimum wick (sebagai % dari total range candle, 0.0 – 1.0)
 MARUBOZU_MAX_WICK   = 0.05  # Marubozu: wick maks 5% dari range
-IMPULSE_MAX_WICK    = 0.20  # Impulse: wick maks 20% dari range
+IMPULSE_MAX_WICK    = 0.15  # TURUN dari 0.20 ke 0.15 → wick harus lebih kecil
 
-# Parameter Pin Bar / Hammer / Shooting Star
-PINBAR_MIN_WICK     = 0.60  # Lower/upper wick minimal 60% dari total range
-PINBAR_MAX_OPP_WICK = 0.10  # Wick berlawanan maksimal 10% dari total range
+# Parameter Pin Bar / Hammer / Shooting Star (tidak dipakai di live, hanya referensi)
+PINBAR_MIN_WICK     = 0.60
+PINBAR_MAX_OPP_WICK = 0.10
+
+# ---------------------------------------------------------------------------
+# 3b. Filter Kualitas Sinyal (WIN RATE 70%+)
+# ---------------------------------------------------------------------------
+# Filter Sesi: hanya trade di jam London (07-12 UTC) dan NY (12-20 UTC)
+USE_SESSION_FILTER     = True
+
+# Filter Volume: candle sinyal harus punya volume >= N x rata-rata 20 candle
+USE_VOLUME_FILTER      = True
+VOLUME_MULTIPLIER      = 1.3   # 1.3x = 30% lebih besar dari rata-rata
+
+# Filter Trend Momentum: minimal 2 dari 3 candle sebelumnya harus searah sinyal
+USE_TREND_MOMENTUM     = True
+TREND_MOMENTUM_LOOKBACK= 3
+
+# Filter Struktur: tidak ada candle besar berlawanan dalam 5 candle terakhir
+USE_STRUCTURE_FILTER   = True
 
 # ---------------------------------------------------------------------------
 # 4. Strategi Limit Order (Pending Order)

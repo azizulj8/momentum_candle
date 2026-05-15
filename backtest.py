@@ -24,8 +24,9 @@ except ImportError:
 import config as cfg
 from candle_detector import (
     add_candle_metrics, calculate_atr, calculate_ema,
-    detect_marubozu_bullish, detect_bullish_impulse, detect_hammer,
-    detect_marubozu_bearish, detect_bearish_impulse, detect_shooting_star,
+    detect_bullish_impulse, detect_bearish_impulse,
+    is_london_ny_session, has_volume_spike,
+    has_trend_momentum, has_clean_structure,
 )
 
 
@@ -37,29 +38,37 @@ from candle_detector import (
 class BacktestConfig:
     # Data
     symbol        : str   = cfg.SYMBOL
-    days          : int   = 60        # Berapa hari history yang diuji
+    days          : int   = 60
     timeframe_str : str   = "M1"
 
-    # Parameter Strategi (diambil dari config, bisa di-override)
-    atr_period        : int   = cfg.ATR_PERIOD
-    ema_period        : int   = cfg.EMA_PERIOD
-    use_ema_filter    : bool  = cfg.USE_EMA_FILTER
-    marubozu_body_mult: float = cfg.MARUBOZU_BODY_MULT
-    impulse_body_mult : float = cfg.IMPULSE_BODY_MULT
-    marubozu_max_wick : float = cfg.MARUBOZU_MAX_WICK
-    impulse_max_wick  : float = cfg.IMPULSE_MAX_WICK
-    pinbar_min_wick   : float = cfg.PINBAR_MIN_WICK
+    # Parameter Strategi
+    atr_period         : int   = cfg.ATR_PERIOD
+    ema_period         : int   = cfg.EMA_PERIOD
+    use_ema_filter     : bool  = cfg.USE_EMA_FILTER
+    marubozu_body_mult : float = cfg.MARUBOZU_BODY_MULT
+    impulse_body_mult  : float = cfg.IMPULSE_BODY_MULT   # default 1.5
+    marubozu_max_wick  : float = cfg.MARUBOZU_MAX_WICK
+    impulse_max_wick   : float = cfg.IMPULSE_MAX_WICK    # default 0.15
+    pinbar_min_wick    : float = cfg.PINBAR_MIN_WICK
     pinbar_max_opp_wick: float = cfg.PINBAR_MAX_OPP_WICK
 
-    retrace_ratio     : float = cfg.RETRACE_RATIO
-    sl_buffer_pips    : float = cfg.SL_BUFFER_PIPS
-    rr_ratio          : float = cfg.RR_RATIO
-    order_expiry_candles: int = 1     # Limit order aktif selama N candle
+    retrace_ratio      : float = cfg.RETRACE_RATIO
+    sl_buffer_pips     : float = cfg.SL_BUFFER_PIPS
+    rr_ratio           : float = cfg.RR_RATIO
+    order_expiry_candles: int  = 1
+
+    # Filter Kualitas (4 filter baru)
+    use_session_filter     : bool  = cfg.USE_SESSION_FILTER
+    use_volume_filter      : bool  = cfg.USE_VOLUME_FILTER
+    volume_multiplier      : float = cfg.VOLUME_MULTIPLIER
+    use_trend_momentum     : bool  = cfg.USE_TREND_MOMENTUM
+    trend_momentum_lookback: int   = cfg.TREND_MOMENTUM_LOOKBACK
+    use_structure_filter   : bool  = cfg.USE_STRUCTURE_FILTER
 
     # Simulasi
     initial_balance : float = 10_000.0
     lot_size        : float = 0.01
-    pip_size        : float = 0.10    # XAUUSD: 1 pip = $0.10 per 0.01 lot
+    pip_size        : float = 0.10
 
 
 # =============================================================================
@@ -146,36 +155,22 @@ class Trade:
 
 def _detect_candle_type(row: pd.Series, atr: float, cfg_bt: BacktestConfig) -> tuple[str, str]:
     """
-    Mendeteksi tipe candle dan arah sinyal.
+    Mendeteksi tipe candle: HANYA Bullish/Bearish Impulse.
     Returns: (candle_type, signal) atau ("", "")
     """
-    # Buat objek config sederhana untuk kompatibilitas candle_detector
     class _Cfg:
-        MARUBOZU_BODY_MULT  = cfg_bt.marubozu_body_mult
-        IMPULSE_BODY_MULT   = cfg_bt.impulse_body_mult
-        MARUBOZU_MAX_WICK   = cfg_bt.marubozu_max_wick
-        IMPULSE_MAX_WICK    = cfg_bt.impulse_max_wick
-        PINBAR_MIN_WICK     = cfg_bt.pinbar_min_wick
-        PINBAR_MAX_OPP_WICK = cfg_bt.pinbar_max_opp_wick
-
+        MARUBOZU_BODY_MULT   = cfg_bt.marubozu_body_mult
+        IMPULSE_BODY_MULT    = cfg_bt.impulse_body_mult
+        MARUBOZU_MAX_WICK    = cfg_bt.marubozu_max_wick
+        IMPULSE_MAX_WICK     = cfg_bt.impulse_max_wick
+        PINBAR_MIN_WICK      = cfg_bt.pinbar_min_wick
+        PINBAR_MAX_OPP_WICK  = cfg_bt.pinbar_max_opp_wick
     c = _Cfg()
 
-    # BUY signals
-    if detect_marubozu_bullish(row, atr, c):
-        return "Marubozu Bullish", "BUY"
     if detect_bullish_impulse(row, atr, c):
         return "Bullish Impulse", "BUY"
-    if detect_hammer(row, c):
-        return "Hammer", "BUY"
-
-    # SELL signals
-    if detect_marubozu_bearish(row, atr, c):
-        return "Marubozu Bearish", "SELL"
     if detect_bearish_impulse(row, atr, c):
         return "Bearish Impulse", "SELL"
-    if detect_shooting_star(row, c):
-        return "Shooting Star", "SELL"
-
     return "", ""
 
 
@@ -207,12 +202,18 @@ def run_backtest(df: pd.DataFrame, cfg_bt: BacktestConfig) -> list[Trade]:
         row = df.iloc[i]
         atr = df['atr'].iloc[i]
         ema = df['ema'].iloc[i]
+        ts  = df.index[i]
 
         if pd.isna(atr) or atr == 0:
             i += 1
             continue
 
-        # Filter tren EMA
+        # Filter 1: Sesi London/NY
+        if cfg_bt.use_session_filter and not is_london_ny_session(ts):
+            i += 1
+            continue
+
+        # Filter 2: EMA trend
         price = row['close']
         if cfg_bt.use_ema_filter:
             allow_buy  = price > ema
@@ -225,11 +226,28 @@ def run_backtest(df: pd.DataFrame, cfg_bt: BacktestConfig) -> list[Trade]:
         if not candle_type:
             i += 1
             continue
-
-        if signal == "BUY" and not allow_buy:
+        if signal == "BUY"  and not allow_buy:
             i += 1
             continue
         if signal == "SELL" and not allow_sell:
+            i += 1
+            continue
+
+        # Filter 3: Volume spike
+        if cfg_bt.use_volume_filter and not has_volume_spike(
+                df, i, multiplier=cfg_bt.volume_multiplier):
+            i += 1
+            continue
+
+        # Filter 4: Trend momentum
+        if cfg_bt.use_trend_momentum and not has_trend_momentum(
+                df, i, signal, cfg_bt.trend_momentum_lookback):
+            i += 1
+            continue
+
+        # Filter 5: Struktur bersih
+        if cfg_bt.use_structure_filter and not has_clean_structure(
+                df, i, signal, atr):
             i += 1
             continue
 
@@ -477,12 +495,16 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Backtest Strategi Momentum Candle M1 XAUUSD"
     )
-    parser.add_argument("--days",       type=int,   default=60,   help="Jumlah hari history (default: 60)")
-    parser.add_argument("--rr",         type=float, default=cfg.RR_RATIO, help="Risk:Reward ratio")
-    parser.add_argument("--body_mult",  type=float, default=cfg.IMPULSE_BODY_MULT, help="Body multiplier ATR")
-    parser.add_argument("--retrace",    type=float, default=cfg.RETRACE_RATIO, help="Retrace ratio entry limit (0.38)")
+    parser.add_argument("--days",       type=int,   default=60,   help="Jumlah hari history")
+    parser.add_argument("--rr",         type=float, default=cfg.RR_RATIO,           help="Risk:Reward ratio")
+    parser.add_argument("--body_mult",  type=float, default=cfg.IMPULSE_BODY_MULT,  help="Body multiplier ATR (default 1.5)")
+    parser.add_argument("--retrace",    type=float, default=cfg.RETRACE_RATIO,      help="Retrace ratio entry limit")
     parser.add_argument("--no_ema",     action="store_true", help="Matikan filter EMA")
-    parser.add_argument("--csv",        type=str,   default=None, help="Path file CSV alternatif (jika tanpa MT5)")
+    parser.add_argument("--no_session", action="store_true", help="Matikan filter sesi London/NY")
+    parser.add_argument("--no_volume",  action="store_true", help="Matikan filter volume")
+    parser.add_argument("--no_momentum",action="store_true", help="Matikan filter trend momentum")
+    parser.add_argument("--no_struct",  action="store_true", help="Matikan filter struktur harga")
+    parser.add_argument("--csv",        type=str,   default=None, help="Path file CSV (jika tanpa MT5)")
     parser.add_argument("--save_csv",   action="store_true", help="Simpan hasil trade ke CSV")
     return parser.parse_args()
 
@@ -491,11 +513,15 @@ def main():
     args = parse_args()
 
     cfg_bt = BacktestConfig(
-        days              = args.days,
-        rr_ratio          = args.rr,
-        impulse_body_mult = args.body_mult,
-        retrace_ratio     = args.retrace,
-        use_ema_filter    = not args.no_ema,
+        days                   = args.days,
+        rr_ratio               = args.rr,
+        impulse_body_mult      = args.body_mult,
+        retrace_ratio          = args.retrace,
+        use_ema_filter         = not args.no_ema,
+        use_session_filter     = not args.no_session,
+        use_volume_filter      = not args.no_volume,
+        use_trend_momentum     = not args.no_momentum,
+        use_structure_filter   = not args.no_struct,
     )
 
     # Ambil data

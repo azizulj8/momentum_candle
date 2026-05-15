@@ -31,17 +31,24 @@ def get_pip_size(symbol: str) -> float:
 
 
 def get_filling_mode(symbol: str) -> int:
-    """Deteksi filling mode yang didukung broker secara otomatis."""
+    """
+    Deteksi filling mode yang didukung broker secara otomatis.
+
+    MT5 Python API tidak punya konstanta SYMBOL_FILLING_FOK/IOC.
+    Filling mode dicek via bitmask integer pada symbol_info.filling_mode:
+      bit 0 (nilai 1) = FOK diizinkan broker
+      bit 1 (nilai 2) = IOC diizinkan broker
+    Jika tidak ada keduanya → gunakan RETURN (mode paling umum).
+    """
     if mt5 is None:
-        return mt5.ORDER_FILLING_IOC if mt5 else 1
+        return 1  # fallback IOC
     info = mt5.symbol_info(symbol)
     if info is None:
         return mt5.ORDER_FILLING_IOC
-    filling = info.filling_mode
-    # Cek urutan preferensi: FOK → IOC → RETURN
-    if filling & mt5.SYMBOL_FILLING_FOK:
+    filling = info.filling_mode  # integer bitmask dari broker
+    if filling & 1:              # bit 0 = FOK
         return mt5.ORDER_FILLING_FOK
-    elif filling & mt5.SYMBOL_FILLING_IOC:
+    elif filling & 2:            # bit 1 = IOC
         return mt5.ORDER_FILLING_IOC
     else:
         return mt5.ORDER_FILLING_RETURN
